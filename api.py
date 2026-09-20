@@ -3,6 +3,7 @@ from typing import Optional, Dict, Any, AsyncGenerator, Literal, List
 import json
 from .pow import DeepSeekPOW
 import asyncio
+import re
 from pathlib import Path
 import sys
 import subprocess
@@ -61,6 +62,15 @@ class DeepSeekAPI:
         self.auth_token = auth_token
         self.pow_solver = DeepSeekPOW()
         self.last_message_id: Dict[str, Any] = {}
+        self._fragment_types: Dict[Any, str] = {}
+        self._active_fragment_id: Any = None
+        self._current_fragment_type: str = 'RESPONSE'
+        self._show_thinking: bool = False
+        self._reference_map: Dict[int, Dict[str, Any]] = {}
+        self._search_results: List[Dict[str, Any]] = []
+        self._marker_to_ref_id: Dict[int, int] = {}
+        self._marker_ref_type: Dict[int, str] = {}
+        self._tool_fragments: Dict[int, Dict[str, Any]] = {}
 
         self.session = AsyncSession()
 
@@ -91,7 +101,7 @@ class DeepSeekAPI:
             'x-app-version': '20241129.1',
             'x-client-locale': 'en_US',
             'x-client-platform': 'web',
-            'x-client-version': '2.0.0',
+            'x-client-version': '2.5.0',
         }
 
         if pow_response:
@@ -254,10 +264,10 @@ class DeepSeekAPI:
             'origin': 'https://chat.deepseek.com',
             'referer': 'https://chat.deepseek.com/',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-            'x-app-version': '2.0.0',
+            'x-app-version': '2.5.0',
             'x-client-locale': 'en_US',
             'x-client-platform': 'web',
-            'x-client-version': '2.0.0',
+            'x-client-version': '2.5.0',
             'x-ds-pow-response': pow_response,
             'x-model-type': self.MODEL_TYPE
         }
@@ -403,7 +413,8 @@ class DeepSeekAPI:
         parent_message_id: Optional[str] = None,
         ref_file_ids: Optional[List[str]] = None,
         thinking_enabled: bool = True,
-        search_enabled: bool = False
+        search_enabled: bool = False,
+        show_thinking: bool = False
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Send a message and get streaming response
@@ -415,6 +426,7 @@ class DeepSeekAPI:
             ref_file_ids (Optional[List[str]]): List of file IDs to reference
             thinking_enabled (bool): Whether to show the thinking process
             search_enabled (bool): Whether to enable web search for up-to-date information
+            show_thinking (bool): Whether to include thinking fragments in the output
             
         Returns:
             AsyncGenerator[Dict[str, Any], None]: Yields message chunks with content and type
@@ -424,8 +436,8 @@ class DeepSeekAPI:
             raise ValueError("Prompt must be a non-empty string")
         if not chat_session_id or not isinstance(chat_session_id, str):
             raise ValueError("Chat session ID must be a non-empty string")
-        if ref_file_ids and search_enabled:
-            raise UploadFilesUnavailable("To use file uploads, you need to turn off the search.")
+        # if ref_file_ids and search_enabled:
+        #     raise UploadFilesUnavailable("To use file uploads, you need to turn off the search.")
 
         json_data = {
             'chat_session_id': chat_session_id,
@@ -444,6 +456,16 @@ class DeepSeekAPI:
         pow_response = await self.pow_solver.solve_challenge(challenge)
 
         headers = self._get_headers(pow_response)
+
+        self._show_thinking = show_thinking
+        self._current_fragment_type = 'RESPONSE'
+        self._fragment_types = {}
+        self._reference_map = {}
+        self._search_results = []
+        self._active_fragment_id = None
+        self._marker_to_ref_id = {}
+        self._marker_ref_type = {}
+        self._tool_fragments = {}
 
         # Use async with for stream
         async with self.session.stream(
@@ -564,6 +586,7 @@ class DeepSeekAPI:
         chat_session_id: str,
         message_id: Optional[int] = None,
         fallback_to_resume: bool = True,
+        show_thinking: bool = False,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Continue a stopped/incomplete stream generation
@@ -575,6 +598,7 @@ class DeepSeekAPI:
                 tracked from the most recent chat_completion call.
             fallback_to_resume (bool): Whether to fall back to resume if
                 the original generation context is no longer available.
+            show_thinking (bool): Whether to include thinking fragments in the output
 
         Returns:
             AsyncGenerator[Dict[str, Any], None]: Yields the same chunk format
@@ -590,6 +614,16 @@ class DeepSeekAPI:
             raise ValueError(
                 "message_id is required when no stream is tracked for this session"
             )
+
+        self._show_thinking = show_thinking
+        self._current_fragment_type = 'RESPONSE'
+        self._fragment_types = {}
+        self._reference_map = {}
+        self._search_results = []
+        self._active_fragment_id = None
+        self._marker_to_ref_id = {}
+        self._marker_ref_type = {}
+        self._tool_fragments = {}
 
         json_data = {
             'chat_session_id': chat_session_id,
@@ -653,12 +687,12 @@ class DeepSeekAPI:
                 v_val = data.get('v')
                 if isinstance(v_val, dict) and 'response' in v_val:
                     fragments = v_val['response'].get('fragments', [])
-                    if fragments:
-                        yield {
-                            'type': 'text',
-                            'content': fragments[0].get('content', ''),
-                            'finish_reason': None,
-                        }
+
+                    self._sync_fragment_tracking(fragments)
+
+                    emitted = self._emit_active_fragment(fragments)
+                    if emitted is not None:
+                        yield emitted
                     continue
 
                 # Delegate remaining chunks to the standard parser
@@ -821,6 +855,179 @@ class DeepSeekAPI:
 
         return json.loads(response.text)
 
+    def _extract_batch_content(self, ops: Any) -> Optional[str]:
+        """Extract the textual content from a BATCH operations list"""
+        if not isinstance(ops, list):
+            return None
+        parts: List[str] = []
+        for op in ops:
+            if (isinstance(op, dict)
+                    and op.get('p') == 'content'
+                    and isinstance(op.get('v'), str)
+                    and op['v'].strip()):
+                parts.append(op['v'])
+        return ''.join(parts) if parts else None
+
+    def _sync_fragment_tracking(self, fragments: Any) -> None:
+        """Update fragment type map and the active fragment from a fragments list.
+
+        The active fragment is the one currently receiving content appends.
+        It is inferred as the fragment with the most recent non-empty content
+        (falling back to the last created fragment), because the fragment array
+        in accumulated state snapshots may already contain future fragments.
+        """
+        if not isinstance(fragments, list) or not fragments:
+            return
+
+        for fr in fragments:
+            if isinstance(fr, dict) and fr.get('id') is not None:
+                self._fragment_types[fr['id']] = fr.get('type', 'RESPONSE')
+                refs = fr.get('references')
+                if isinstance(refs, list):
+                    self._update_references(refs)
+                self._register_tool_fragment(fr)
+
+        last_non_empty = None
+        for fr in fragments:
+            if isinstance(fr, dict) and fr.get('content'):
+                last_non_empty = fr.get('id')
+
+        last_created = None
+        if isinstance(fragments[-1], dict):
+            last_created = fragments[-1].get('id')
+
+        active_id = last_non_empty if last_non_empty is not None else last_created
+        if active_id is not None:
+            self._active_fragment_id = active_id
+            self._current_fragment_type = self._fragment_types.get(active_id, 'RESPONSE')
+
+    def _update_references(self, refs: Any) -> None:
+        """Accumulate reference metadata keyed by reference id"""
+        if not isinstance(refs, list):
+            return
+        for ref in refs:
+            if isinstance(ref, dict) and ref.get('id') is not None:
+                rid = ref['id']
+                if rid not in self._reference_map:
+                    self._reference_map[rid] = {}
+                self._reference_map[rid].update(ref)
+
+    def _register_tool_fragment(self, fr: Dict[str, Any]) -> None:
+        """Remember TOOL_OPEN/TOOL_SEARCH fragments by id.
+
+        A citation reference {id, type} points at one of these fragments.
+        TOOL_OPEN fragments carry the actual source URL in their `result`
+        field, which is what we link to.
+        """
+        ftype = fr.get('type')
+        if ftype not in ('TOOL_OPEN', 'TOOL_SEARCH'):
+            return
+        if fr.get('id') is None:
+            return
+        self._tool_fragments[fr['id']] = fr
+
+    def _map_markers_to_refs(self, content: str, refs: List[Dict[str, Any]]) -> None:
+        """Map [reference:N] markers to reference objects carried by the same BATCH op.
+
+        The marker number in the content is just a sequential citation counter;
+        the reference {id, type} points to the TOOL_OPEN/TOOL_SEARCH fragment
+        (identified by `id`) that the citation refers to.
+        """
+        if not content or not refs:
+            return
+        markers = [int(m) for m in re.findall(r'\[reference:(\d+)\]', content)]
+        for marker, ref in zip(markers, refs):
+            rid = ref.get('id')
+            if rid is None:
+                continue
+            self._marker_to_ref_id[marker] = rid
+            self._marker_ref_type[marker] = ref.get('type', '')
+
+    def _clean_references(self, content: str) -> str:
+        """Replace [reference:N] markers with markdown links [[N]](url), or drop them"""
+        if not content or '[reference:' not in content:
+            return content
+
+        def repl(m):
+            marker = int(m.group(1))
+            rid = self._marker_to_ref_id.get(marker)
+            rtype = self._marker_ref_type.get(marker, '')
+            link = None
+            if rid is not None:
+                # 1) explicit url from reference metadata (keyed by reference id)
+                ref = self._reference_map.get(rid)
+                if ref and ref.get('url'):
+                    link = ref['url']
+                # 2) TOOL_OPEN fragment carries the actual source URL
+                elif rtype == 'TOOL_OPEN' and rid in self._tool_fragments:
+                    result = self._tool_fragments[rid].get('result') or {}
+                    link = result.get('url')
+            if not link:
+                return ''
+            rendered = f'[[{marker}]]({link})'
+            # keep a separating space before the citation link
+            if m.start() > 0 and content[m.start() - 1] not in ' \t\n\r':
+                rendered = ' ' + rendered
+            return rendered
+
+        return re.sub(r'\[reference:(\d+)\]', repl, content)
+
+    def _update_search_results(self, results: Any, op: Optional[str] = None) -> None:
+        """Accumulate search results. Always extend; reference ids are global
+        1-based indices into the combined list across all query result sets."""
+        if not isinstance(results, list):
+            return
+        self._search_results.extend(results)
+
+    def _sync_content_fragment(self, fragment_id: Any) -> None:
+        """Mark the fragment receiving incremental content appends as active"""
+        if fragment_id is None:
+            return
+        self._active_fragment_id = fragment_id
+        if fragment_id in self._fragment_types:
+            self._current_fragment_type = self._fragment_types[fragment_id]
+
+    def _current_type(self) -> str:
+        """Type of the currently active fragment"""
+        if self._active_fragment_id is not None:
+            return self._fragment_types.get(self._active_fragment_id, self._current_fragment_type)
+        return self._current_fragment_type
+
+    def _emit_active_fragment(self, fragments: Any) -> Optional[Dict[str, Any]]:
+        """Return a content chunk for the active fragment, or None if it should be skipped"""
+        active_id = self._active_fragment_id
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                continue
+            if active_id is not None and fragment.get('id') != active_id:
+                continue
+
+            content = fragment.get('content')
+            if not isinstance(content, str) or not content.strip():
+                return None
+
+            content = self._clean_references(content)
+            if not content:
+                return None
+
+            ftype = fragment.get('type', 'RESPONSE')
+            if ftype == 'RESPONSE':
+                return {
+                    'type': 'text',
+                    'content': content,
+                    'finish_reason': None
+                }
+            if ftype == 'THINK':
+                if not self._show_thinking:
+                    return None
+                return {
+                    'type': 'thinking',
+                    'content': content,
+                    'finish_reason': None
+                }
+            return None
+        return None
+
     def _parse_chunk_sync(self, chunk: str) -> Optional[Dict[str, Any]]:
         """Parse a SSE chunk from the API response (synchronous version)"""
         if not chunk:
@@ -843,21 +1050,20 @@ class DeepSeekAPI:
             # Parse JSON
             data = json.loads(data_str)
 
-            # Handle nested response format (first message with full structure)
+            # Handle nested response format (accumulated snapshot with full structure)
             if 'v' in data and isinstance(data['v'], dict) and 'response' in data['v']:
                 response_data = data['v']['response']
                 fragments = response_data.get('fragments', [])
 
-                # Extract text from RESPONSE type fragments
-                for fragment in fragments:
-                    if fragment.get('type') == 'RESPONSE' and fragment.get('content'):
-                        content = fragment['content']
-                        if isinstance(content, str) and content.strip():
-                            return {
-                                'type': 'text',
-                                'content': content,
-                                'finish_reason': None
-                            }
+                # Collect any top-level references
+                self._update_references(response_data.get('references'))
+
+                # Update fragment tracking (active fragment + type map)
+                self._sync_fragment_tracking(fragments)
+
+                emitted = self._emit_active_fragment(fragments)
+                if emitted is not None:
+                    return emitted
 
                 # Check for message IDs in the response structure
                 if 'message_id' in response_data:
@@ -868,23 +1074,114 @@ class DeepSeekAPI:
                         'content': ''
                     }
 
+            # Handle new fragment append (response/fragments) to track its type
+            if data.get('p') == 'response/fragments' and data.get('o') == 'APPEND':
+                fragments = data.get('v', [])
+                if isinstance(fragments, list) and fragments:
+                    self._sync_fragment_tracking(fragments)
+
+                    fragment = fragments[-1]
+                    new_id = fragment.get('id')
+                    # The newly appended fragment becomes the active one being written
+                    if new_id is not None:
+                        self._active_fragment_id = new_id
+                        self._current_fragment_type = fragment.get('type', 'RESPONSE')
+
+                    content = fragment.get('content') or ''
+                    if isinstance(content, str):
+                        content = self._clean_references(content)
+                    if content.strip():
+                        ftype = fragment.get('type')
+                        if ftype == 'THINK':
+                            if not self._show_thinking:
+                                return None
+                            return {
+                                'type': 'thinking',
+                                'content': content,
+                                'finish_reason': None
+                            }
+                        return {
+                            'type': 'text',
+                            'content': content,
+                            'finish_reason': None
+                        }
+                return None
+
             # Handle chunks with just 'v' field (simplified format)
-            if 'v' in data and 'p' not in data and not isinstance(data['v'], dict):
-                v_value = data.get('v', '')
+            if 'v' in data and 'p' not in data and isinstance(data['v'], str):
+                ftype = self._current_type()
+                if ftype == 'THINK' and not self._show_thinking:
+                    return None
                 return {
-                    'type': 'text',
-                    'content': str(v_value),
+                    'type': 'thinking' if ftype == 'THINK' else 'text',
+                    'content': self._clean_references(str(data['v'])),
                     'finish_reason': None
                 }
 
-            # Handle full DeepSeek format with 'p' and 'v' fields
-            if 'v' in data and data.get('p') == 'response/fragments/-1/content' and data.get('o') == 'APPEND':
-                v_value = data.get('v', '')
-                if isinstance(v_value, dict):
+            # Handle BATCH operations carrying a list of relative sub-operations
+            # (e.g. content + references metadata when a search reference is inserted)
+            if data.get('o') == 'BATCH' and isinstance(data.get('v'), list):
+                ref_objs: List[Dict[str, Any]] = []
+                for op in data['v']:
+                    if not isinstance(op, dict):
+                        continue
+                    if op.get('p') == 'references' and isinstance(op.get('v'), list):
+                        self._update_references(op['v'])
+                        for r in op['v']:
+                            if isinstance(r, dict) and r.get('id') is not None:
+                                ref_objs.append(r)
+                    elif op.get('p') == 'results' and isinstance(op.get('v'), list):
+                        self._update_search_results(op['v'], op.get('o'))
+                    elif op.get('p') == 'fragments' and isinstance(op.get('v'), list):
+                        for fr in op['v']:
+                            if isinstance(fr, dict):
+                                self._register_tool_fragment(fr)
+
+                content = self._extract_batch_content(data['v']) or ''
+                self._map_markers_to_refs(content, ref_objs)
+                content = self._clean_references(content)
+                if not content:
                     return None
+
+                ftype = self._current_type()
+                if ftype == 'THINK' and not self._show_thinking:
+                    return None
+
                 return {
-                    'type': 'text',
-                    'content': str(v_value),
+                    'type': 'thinking' if ftype == 'THINK' else 'text',
+                    'content': content,
+                    'finish_reason': None
+                }
+
+            # Handle reference metadata appends
+            fragment_refs_match = re.match(r'^response/fragments/(-?\d+)/references$', data.get('p', ''))
+            if fragment_refs_match and isinstance(data.get('v'), list):
+                self._update_references(data['v'])
+                return None
+
+            # Handle search results (carry the actual URLs for references)
+            fragment_results_match = re.match(r'^response/fragments/(-?\d+)/results$', data.get('p', ''))
+            if fragment_results_match and isinstance(data.get('v'), list):
+                self._update_search_results(data['v'], data.get('o'))
+                return None
+
+            content_match = re.match(r'^response/fragments/(-?\d+)/content$', data.get('p', ''))
+            if content_match and 'v' in data:
+                fragment_id = content_match.group(1)
+                if fragment_id != '-1':
+                    self._sync_content_fragment(int(fragment_id))
+
+                v_value = data.get('v')
+                if not isinstance(v_value, str):
+                    return None
+
+                ftype = self._current_type()
+                if ftype == 'THINK' and not self._show_thinking:
+                    return None
+
+                return {
+                    'type': 'thinking' if ftype == 'THINK' else 'text',
+                    'content': self._clean_references(v_value),
                     'finish_reason': None
                 }
 
